@@ -1,8 +1,11 @@
+from re import S
 import ks_api_client
 import base64
 import json
 import os
 import socketio
+import requests
+import urllib.parse
 from urllib3 import make_headers
 
 from ks_api_client.exceptions import ApiException, ApiValueError
@@ -12,10 +15,10 @@ from ks_api_client.models import NewMTFOrder, NewNormalOrder, NewOrder, \
                 UserCredentials, UserDetails, NewMISOrder, InlineObject
 
 class KSTradeApi():
-    def __init__(self, access_token, userid, consumer_key, ip, app_id, 
-            hosts=["https://tradeapi.kotaksecurities.com/apim","https://sbx.kotaksecurities.com/apim"],
-            proxy_url = '', proxy_user = '', proxy_pass = ''):
+    def __init__(self, access_token, userid, consumer_key, ip, app_id, host = None,
+            proxy_url = '', proxy_user = '', proxy_pass = '', verify_ssl=True):
         self.userid  =  userid
+        self.host = host
         self.consumer_key  =  consumer_key
         self.ip  =  ip
         self.app_id  =  app_id
@@ -23,39 +26,54 @@ class KSTradeApi():
         self._proxy_user = proxy_user
         self._proxy_pass = proxy_pass
         self._proxy_url = proxy_url
+        self._verify_ssl = verify_ssl
         error = None
-        session_init = None
-        for host in hosts:
-            self.host = host
-            configuration  =  self.get_config(proxy_url, proxy_user, proxy_pass)
-            try:
-                self.api_client  =  ks_api_client.ApiClient(configuration)
-                session_init_res  =  ks_api_client.SessionApi(self.api_client).session_init(self.userid, \
-                                self.consumer_key, self.ip, self.app_id)
-            except ApiException as ex:
-                error = ex
-                continue
-            if(session_init_res.get("Success")):
-                session_init = session_init_res.get("Success")
-            elif(session_init_res.get("success")):
-                session_init = session_init_res.get("success")
-            if self.host !=  session_init['redirect']['host']:
-                self.host  =  session_init['redirect']['host']
-                configuration  =  self.get_config(proxy_url, proxy_user, proxy_pass)
-                self.api_client  =  ks_api_client.ApiClient(configuration)
-                session_init  =  ks_api_client.SessionApi(self.api_client).session_init(self.userid, \
-                                self.consumer_key, self.ip, self.app_id)
-            break
-        if not session_init and error:
-            raise error
+        self.__session_init = None
 
-    def get_config(self, proxy_url = '', proxy_user = '', proxy_pass = ''):
+        def init_session(self, session_init_res):
+            if(session_init_res.get("Success")):
+                self.__session_init = session_init_res.get("Success")
+            elif(session_init_res.get("success")):
+                self.__session_init = session_init_res.get("success")
+            if self.host !=  self.__session_init['redirect']['host']:
+                self.host  =  self.__session_init['redirect']['host']
+                configuration  =  self.get_config(proxy_url, proxy_user, proxy_pass, verify_ssl)
+                self.api_client  =  ks_api_client.ApiClient(configuration)
+                self.__session_init  =  ks_api_client.SessionApi(self.api_client).session_init(self.userid, \
+                                self.consumer_key, self.ip, self.app_id)
+        if self.host:
+            configuration  =  self.get_config(proxy_url, proxy_user, proxy_pass, verify_ssl)
+            self.api_client  =  ks_api_client.ApiClient(configuration)
+            session_init_res  =  ks_api_client.SessionApi(self.api_client).session_init(self.userid, \
+                            self.consumer_key, self.ip, self.app_id)
+            init_session(self, session_init_res)
+        else:
+            hosts = ["https://tradeapi.kotaksecurities.com/apim","https://sbx.kotaksecurities.com/apim"]
+            for host in hosts:
+                self.host = host
+                configuration  =  self.get_config(proxy_url, proxy_user, proxy_pass, verify_ssl)
+                try:
+                    self.api_client  =  ks_api_client.ApiClient(configuration)
+                    session_init_res  =  ks_api_client.SessionApi(self.api_client).session_init(self.userid, \
+                                    self.consumer_key, self.ip, self.app_id)
+                except ApiException as ex:
+                    error = ex
+                    continue
+                init_session(self, session_init_res)
+                break
+        if not self.__session_init and error:
+            raise error
+        del self.__session_init
+
+    def get_config(self, proxy_url = '', proxy_user = '', proxy_pass = '', verify_ssl=True):
         configuration  =  ks_api_client.Configuration(self.host)
         configuration.access_token  =  self.access_token
         if proxy_url:
             configuration.proxy = proxy_url
             if proxy_user:
                 configuration.proxy_headers = make_headers(proxy_basic_auth = ':'.join((proxy_user,proxy_pass)))
+            if not verify_ssl:
+                configuration.verify_ssl = False
         return configuration
 
     def login(self, password):
@@ -234,7 +252,7 @@ class KSTradeApi():
                 ReqMargin = req_margin)
         return margin_required
 
-    def get_margins(self):
+    def margin(self):
         margins = ks_api_client.MarginApi(self.api_client).get_margins(self.consumer_key,self.session_token)
         return margins
 		
@@ -293,7 +311,8 @@ class KSTradeApi():
                 raise ApiValueError("exchange,co_code,period,cnt fields are required.")    
         encoded_json = base64.urlsafe_b64encode(json.dumps(json_input).encode()).decode()
         data = ks_api_client.HistoricalApi(self.api_client).get_resource(resource,encoded_json)
-        return data					 
+        return data
+			 
 #-------- Convert Array and object snake_case keys to camelCase -----------
     def convertObject(self, object):  
         newObj={}
@@ -315,13 +334,12 @@ class KSTradeApi():
         return new_array
 
 
-    def subscribe(self, input_tokens, callback, auth_token, broadcast_host="https://wstreamer.kotaksecurities.com"):
+    def subscribe(self, input_tokens, consumer_key, consumer_secret, callback=print, broadcast_host="https://wstreamer.kotaksecurities.com"):
         try:
+            auth_token = ":".join((consumer_key, consumer_secret))
             proxy = ""
+            session = requests.session()
             if self._proxy_pass or self._proxy_url or self._proxy_user:
-                import urllib.parse
-                import requests
-                session = requests.session()
                 scheme = ""
                 parsed = urllib.parse.urlparse(self._proxy_url)
                 if not parsed.scheme:
@@ -334,7 +352,7 @@ class KSTradeApi():
                     if parsed.port:
                         proxy += ":" + str(parsed.port)
                     session.proxies.update({'http':proxy, 'https':proxy})
-                    session.verify = 's' in scheme
+                    session.verify = self._verify_ssl
             # Generating base64 encoding of consumer credentials
             AUTH_BASE64 = base64.b64encode(auth_token.encode("UTF-8"))
             PAYLOAD = {"authentication": AUTH_BASE64.decode("UTF-8")}
@@ -348,7 +366,7 @@ class KSTradeApi():
             else:
                 self.sio = socketio.Client(
                     reconnection=True, request_timeout=20, reconnection_attempts=5, engineio_logger=True, 
-                            logger=True,http_session=session, ssl_verify=session.verify)
+                            logger=True, http_session=session, ssl_verify=session.verify)
 
                 @self.sio.event
                 def connect():
@@ -365,8 +383,7 @@ class KSTradeApi():
                 @self.sio.on('getdata')
                 def on_getdata(data, callback=callback):
                     callback(data)
-                
-                # Do the connection using above access token
+
                 self.sio.connect(broadcast_host, 
                         headers={'Authorization': 'Bearer ' + jsonResponse['result']['token']},
                         transports=["websocket"], socketio_path='/feed')
